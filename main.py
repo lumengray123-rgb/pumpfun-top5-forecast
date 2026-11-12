@@ -17,12 +17,17 @@ frequencies averaged over the seven reads. Sizes mix the simulated
 order-statistic distribution with a "fresh leader" component, because the
 top of the chart is a renewing population: coins born after the cut, which
 no forecast can name, regularly take top-5 places, so the cap level of a
-place is steadier than any single coin's path.
+place is steadier than any single coin's path. The fresh component's
+centre follows the recent per-place cap trend (the practice's top-5 caps
+grow over time; a fixed downward decay centred the sizes far too low).
 
 Probability allocation is greedy per place: a coin is named only while its
 simulated probability beats the unnamed share it would otherwise take, and
 a reserve (larger for longer horizons) is always left unnamed so that
-newcomers and unmodeled movers still score better than the floor.
+newcomers and unmodeled movers still score better than the floor. Coins
+the simulation gives almost no chance at a place are named at p 0 there:
+a p=0 row takes its coin out of the place's unnamed share, so the share a
+newcomer scores is divided among fewer coins.
 
 Deterministic: one fixed seed, sorted iteration everywhere it can affect
 the output, probabilities floored to 6 decimals. Standard library only,
@@ -39,9 +44,12 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------- constants
 
 SEED = 20261112
-N_SIMS = 4000            # Monte Carlo paths per coin
+N_SIMS = 20000           # Monte Carlo paths per coin (was 4000: the extra
+                         # sims resolve the small probabilities that decide
+                         # both the greedy naming cut and the p=0 naming)
 MAX_CANDIDATES = 220     # coins simulated (largest by last observed cap)
-MAX_NAMED_PER_PLACE = 90  # schema allows 100 rows per place; keep headroom
+MAX_NAMED_PER_PLACE = 100  # schema allows 100 rows per place; p>0 rows plus
+                         # p=0 rows together may use the full allowance
 TAU_MOMENTUM_H = 1.5     # momentum half-life-ish scale, hours
 BASE_DRIFT_POOL = -0.10  # log10 cap per hour, graduated coins
 BASE_DRIFT_CURVE = -0.16  # log10 cap per hour, coins still on the curve
@@ -53,11 +61,45 @@ LOG_CAP_FLOOR = 0.0      # 1 SOL; below this a coin cannot matter
 GRAD_CAP_MIN = 2.15      # log10 cap where graduation becomes plausible
 GRAD_JUMP_MEAN = -0.30
 GRAD_JUMP_SD = 0.50
-SIZE_FRESH_MIX = 0.40    # weight of the fresh-leader component in sizes
-SIZE_FRESH_SD = 0.45
-SIZE_FRESH_DECAY = 0.03  # log10 per hour the fresh-leader centre drifts down
-SIZE_NAME_CAP = 0.97     # leave 0.03 of each place's size mass unnamed
+# --- size distribution (recalibrated on the practice history) ---
+# The practice showed the size mixture centred far too low (PIT mean 0.88:
+# actual caps sit well above the model's distribution) because the top-5
+# caps grow as new coins pump, while the simulation's negative drift pulls
+# the mixture down. The fresh-leader centre now follows the recent trend
+# of each place's cap (see estimate_size_trend), the fresh component
+# carries more weight (most top-5 places are newborns, whose caps follow
+# the fresh distribution, not the simulation), and more size mass is left
+# unnamed so a tail outcome scores the unnamed share instead of ~0.
+SIZE_FRESH_MIX = 0.55    # weight of the fresh-leader component in sizes
+SIZE_FRESH_SD = 0.55     # sd of the fresh-leader component (log10)
+SIZE_NAME_CAP = 0.75     # name bins up to this total; the rest stays
+                         # unnamed and is shared by the unnamed bins
+                         # (backtests: 0.70-0.80 all beat 0.90 by ~0.7 nats;
+                         # 0.75 keeps more named mass if the centre is right)
+TREND_MARKS = 12         # marks used for the per-place cap trend
+TREND_CLIP_LO = -0.05    # log10/hour, lower clip on the trend slope
+TREND_CLIP_HI = 0.10     # log10/hour, upper clip on the trend slope
+TREND_SHIFT_LO = -0.30   # total centre shift allowed (log10)
+TREND_SHIFT_HI = 0.60
+# --- order allocation ---
 MIN_NAMED_P = 0.0005
+# p=0 naming: a row with p 0 takes its coin out of the place's unnamed
+# share (RULES.txt, Scoring), so naming coins that almost certainly will
+# not hold a place leaves the unnamed share to fewer coins and raises what
+# a newcomer scores. Only coins the simulation gives under P0_Q_MAX at
+# that place, ranked below P0_MIN_RANK at the cut (the top coins can hold
+# any place: the practice's #1 coin faded to places 3 and 5), and only
+# coins in the last mark (likely still on the answer chart, which is what
+# shrinks the denominator).
+P0_Q_MAX = 0.001
+P0_MIN_RANK = 6
+# --- unnamed reserve ---
+# The practice's unnamed outcome rate is ~0.5 at short horizons and the
+# final's 7-13h horizon turns the chart over far more, so the reserve
+# starts higher and grows further than the first version's 0.30 -> 0.42.
+RESERVE_BASE = 0.50
+RESERVE_GROWTH = 0.16
+RESERVE_TAU_H = 6.0
 
 
 def parse_ts(s):
@@ -156,6 +198,50 @@ def estimate_globals(series):
         mean = sum(all_rets) / len(all_rets)
         var = sum((x - mean) ** 2 for x in all_rets) / len(all_rets)
         out["__all__"] = (mean, math.sqrt(var))
+    return out
+
+
+def _slope(pts):
+    """Least-squares slope (per hour) of (epoch, value) points."""
+    n = len(pts)
+    if n < 2:
+        return 0.0
+    t0 = pts[0][0]
+    xs = [(t - t0) / 3600.0 for t, _ in pts]
+    ys = [y for _, y in pts]
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    denom = sum((x - mx) ** 2 for x in xs)
+    if denom <= 0:
+        return 0.0
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+
+
+def estimate_size_trend(marks, places):
+    """Per-place log-cap trend (log10/hour) over the recent marks.
+
+    For each place k, the least-squares slope of the log-cap at place k
+    over the last TREND_MARKS marks, shrunk 50% toward the pooled slope
+    across places and clipped to [TREND_CLIP_LO, TREND_CLIP_HI]. The
+    practice's first-hour growth is steep and transient, so the clip
+    matters: the trend is a small recent-drift signal, not an
+    extrapolation of chart formation. Returns one slope per place.
+    """
+    series = [[] for _ in range(places)]
+    for m in marks[-TREND_MARKS:]:
+        t = parse_ts(m["at"])
+        rows = sorted(m["rows"], key=lambda r: r["rank"])
+        for k in range(places):
+            if k < len(rows):
+                series[k].append(
+                    (t, log_cap_sol(rows[k]["market_cap_lamports"]))
+                )
+    slopes = [_slope(pts) for pts in series]
+    pooled = sum(slopes) / len(slopes) if slopes else 0.0
+    out = []
+    for s in slopes:
+        s = 0.5 * s + 0.5 * pooled
+        out.append(max(TREND_CLIP_LO, min(TREND_CLIP_HI, s)))
     return out
 
 
@@ -284,13 +370,20 @@ def simulate(cands, horizons_h, rng):
 
 # ---------------------------------------------------------------- allocation
 
-def allocate_place(counts, n_sims, n_reads, chart_size, unnamed_reserve):
+def allocate_place(counts, n_sims, n_reads, chart_size, unnamed_reserve,
+                   cand_ranks=None):
     """Greedy probability allocation for one place.
 
     counts: mint -> simulations where it held this place (over all reads).
     Names coins in descending simulated probability while naming beats the
     unnamed share the coin would otherwise take, keeping unnamed_reserve
-    of the place unnamed for newcomers and unmodeled movers.
+    of the place unnamed for newcomers and unmodeled movers. Then adds p=0
+    rows for coins the simulation gives under P0_Q_MAX at this place:
+    a p=0 row takes its coin out of the place's unnamed share, so the
+    share a newcomer scores is divided among fewer coins. Only coins
+    ranked P0_MIN_RANK or lower at the cut are used (the top coins can
+    hold any place), and only coins in the last mark (cand_ranks), since
+    a coin off the answer chart shrinks nothing.
     Returns a list of (mint, p) with p floored to 6 decimals.
     """
     total = n_sims * n_reads
@@ -325,6 +418,21 @@ def allocate_place(counts, n_sims, n_reads, chart_size, unnamed_reserve):
         pf = floor6(p)
         if pf > 0:
             out.append((mint, pf))
+    if cand_ranks:
+        named_mints = {mint for mint, _ in out}
+        p0_cands = []
+        for mint, rank in cand_ranks.items():
+            if rank < P0_MIN_RANK or mint in named_mints:
+                continue
+            q = counts.get(mint, 0) / total * scale
+            if q < P0_Q_MAX:
+                p0_cands.append((rank, mint))
+        # Most likely still on the answer chart first (lowest rank first).
+        p0_cands.sort()
+        for _, mint in p0_cands:
+            if len(out) >= MAX_NAMED_PER_PLACE:
+                break
+            out.append((mint, 0.0))
     return out
 
 
@@ -455,20 +563,31 @@ def main():
 
     # Unnamed reserve: longer horizons mean more of the top 5 will be coins
     # born after the cut (in the practice, 2 of the top 5 at the last read
-    # were). Reserve grows from ~0.30 (short horizon) toward ~0.42.
-    unnamed_reserve = 0.30 + 0.12 * (1.0 - math.exp(-median_h / 6.0))
+    # were, and ~half of all place-reads were unnamed outcomes). The
+    # reserve grows from RESERVE_BASE toward RESERVE_BASE + RESERVE_GROWTH
+    # with the median horizon.
+    unnamed_reserve = RESERVE_BASE + RESERVE_GROWTH * (
+        1.0 - math.exp(-median_h / RESERVE_TAU_H)
+    )
+
+    # Ranks in the last mark, for the p=0 naming (only coins in the last
+    # mark are likely enough on the answer chart to shrink a denominator).
+    cand_ranks = {r["mint"]: r["rank"] for r in last_rows}
 
     probabilities = []
     place_probs = []
     for k in range(places):
         named = allocate_place(
-            place_counts[k], N_SIMS, len(horizons_h), chart_size, unnamed_reserve
+            place_counts[k], N_SIMS, len(horizons_h), chart_size,
+            unnamed_reserve, cand_ranks,
         )
         place_probs.append(dict(named))
         for mint, p in named:
             probabilities.append({"mint": mint, "place": k + 1, "p": p})
 
     # top5: the most likely coin at each place, in order, distinct.
+    # p=0 rows are excluded: they name coins we expect NOT to hold the
+    # place, so they must never be picked as the top-5 guess.
     top5 = []
     used = set()
     for k in range(places):
@@ -476,7 +595,7 @@ def main():
         for mint, p in sorted(
             place_probs[k].items(), key=lambda kv: (-kv[1], kv[0])
         ):
-            if mint not in used:
+            if p > 0 and mint not in used:
                 best = mint
                 break
         if best is None:
@@ -508,16 +627,21 @@ def main():
             used.add(ph)
 
     # Sizes: fresh-leader centre per place from the last mark's caps at
-    # that place, decayed with the median horizon.
+    # that place, shifted by the recent per-place cap trend over the
+    # median horizon (the practice's top-5 caps grow, they do not fall:
+    # a fixed downward decay centred the size distribution far too low).
     last_sorted = sorted(
         (log_cap_sol(r["market_cap_lamports"]) for r in last_rows), reverse=True
     )
+    trends = estimate_size_trend(marks, places)
     sizes = []
     for k in range(places):
         centre = last_sorted[k] if k < len(last_sorted) else (
             last_sorted[-1] if last_sorted else 2.0
         )
-        centre -= SIZE_FRESH_DECAY * median_h
+        shift = trends[k] * median_h
+        shift = max(TREND_SHIFT_LO, min(TREND_SHIFT_HI, shift))
+        centre += shift
         named = allocate_sizes(size_values[k], edges, centre, SIZE_FRESH_SD)
         for b, p in named:
             sizes.append({"place": k + 1, "bin": b, "p": p})
